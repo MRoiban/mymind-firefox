@@ -1,0 +1,30 @@
+name: Build
+
+# Rebuilds against the latest mymind Chrome release. The weekly run is the
+# early warning that a new Chrome version broke patches/firefox.patch.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build from the latest Chrome Web Store release
+        run: scripts/build.sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Lint the Firefox add-on
+        run: npx --yes web-ext@8 lint --source-dir firefox --self-hosted
+

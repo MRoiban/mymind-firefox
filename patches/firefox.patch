@@ -1,0 +1,262 @@
+--- a/components/notification.js
++++ b/components/notification.js
+@@ -143,8 +143,6 @@
+     }
+ 
+     update(props) {
+-      console.log('update', props);
+-
+       // { id, title, tags: [ ], created }
+       this.card = props.card;      
+       this.redirect = props.redirect;
+@@ -773,13 +771,26 @@
+     
+     document.body.appendChild(fontStyle.cloneNode(true)); // Must be outside of the shadow
+ 
+-    const sheet = new CSSStyleSheet();
+-
+-    sheet.replaceSync(await fetch(
+-      browser.runtime.getURL('components/notification.css')
+-    ).then(r => r.text()));
+-
+-    shadow.adoptedStyleSheets = [sheet];
++    // Firefox: adoptedStyleSheets can reject arrays created in the content-script
++    // sandbox, so fall back to linking the stylesheet (the 2.0.2 approach).
++    try {
++      const sheet = new CSSStyleSheet();
++
++      sheet.replaceSync(await fetch(
++        browser.runtime.getURL('components/notification.css')
++      ).then(r => r.text()));
++
++      shadow.adoptedStyleSheets = [sheet];
++    }
++    catch (err) { }
++
++    if (!shadow.adoptedStyleSheets?.length) {
++      shadow.appendChild(createEl('link', {
++        rel  : "stylesheet",
++        type : "text/css",
++        href : browser.runtime.getURL('components/notification.css')
++      }));
++    }
+ 
+     mymind.shadow = shadow;
+ 
+--- a/modules/notification.js
++++ b/modules/notification.js
+@@ -17,7 +17,7 @@
+       }
+     });
+ 
+-    if (injected.result) return;
++    if (injected?.result) return;
+     
+     await browser.scripting.executeScript({ 
+       target: target, 
+--- a/worker.js
++++ b/worker.js
+@@ -37,7 +37,8 @@
+   {
+     title    : "Add to my mind",
+     id       : "mymind-add",
+-    contexts : [ "selection", "image", "audio", "video", "link" ]
++    // Firefox: also "page"/"frame", so right-clicking a post or card works anywhere
++    contexts : [ "selection", "image", "audio", "video", "link", "page", "frame" ]
+   },
+   {
+     title    : "Open my mind",
+@@ -75,14 +76,27 @@
+   }
+ });
+ 
++// Firefox: MV3 host permissions can be revoked by the user in about:addons. Without
++// access to mymind the cookie lookup fails and we'd wrongly ask them to sign in, so
++// re-request it. Must be the first await in a user-action handler to keep the
++// gesture; resolves immediately (no prompt) when access is already granted.
++function ensureHostAccess() {
++  return browser.permissions.request({ origins: [ `https://${mymind.host}/*` ] })
++    .catch(() => false);
++}
++
+ // Browser Action
+ browser.action.onClicked.addListener(async tab => {
++  if (!await ensureHostAccess()) return;
++
+   await savePage(tab);
+ });
+ 
+ // Keyboard Shortcut
+ browser.commands.onCommand.addListener(async (command, tab) => {
+   if (command === "save-page") {
++    if (!await ensureHostAccess()) return;
++
+     await savePage(tab ?? await getActiveTab());
+   }
+ });
+@@ -118,6 +132,12 @@
+   log('menu', info);
+ 
+   if (menuItemId === "mymind-add") {
++    if (!await ensureHostAccess()) return;
++
++    // Firefox: with the "menus" permission the tab can arrive as null; the click
++    // always happens in the active tab (which the click grants activeTab for).
++    tab ??= await getActiveTab();
++
+     if (mediaType && srcUrl) {
+       saveObject({ 
+         media : { url: srcUrl, type: mediaType }, 
+@@ -132,7 +152,7 @@
+       saveSelection(info, tab);
+     }
+     else if (pageUrl) {
+-      savePage(tab);
++      saveContextTarget(info, tab);
+     }
+     else {
+       throw new Error('unsupported');
+@@ -155,18 +175,30 @@
+   log('enabled social integrations', granted);
+ 
+   if (granted) {
++    tab ??= await getActiveTab(); // Firefox: see the "mymind-add" handler
++
+     await initializeSocialIntegrations(tab.id);
+ 
+     ensureWebNavHook();
+   }
+ }
+ 
+-const instagramPattern = new URLPattern({ protocol: "https", hostname: "www.instagram.com" });
++// Firefox: plain URL check instead of URLPattern (not available on older Gecko).
++function isInstagramUrl(url) {
++  try {
++    let u = new URL(url);
++
++    return u.protocol === "https:" && u.hostname === "www.instagram.com";
++  }
++  catch {
++    return false;
++  }
++}
+ 
+ async function webNavigationOnCompleted(e) {
+   if (e.frameId !== 0) return;
+ 
+-  if (e.url && instagramPattern.test(e.url)) {
++  if (e.url && isInstagramUrl(e.url)) {
+     let granted = await browser.permissions.contains({
+       origins: [ 'https://www.instagram.com/*' ],
+     });
+@@ -536,6 +568,14 @@
+     return;
+   }
+ 
++  // Firefox: restricted pages (about:, AMO, reader view, …) don't reject — the
++  // injection resolves with no result, so treat that the same way.
++  if (!injected?.result) {
++    await flashBadge(tab.id, "✕");
++
++    return;
++  }
++
+   let screenshotData = null;
+   
+   try {
+@@ -576,6 +616,75 @@
+   catch (err) {
+     log('could not flash badge', err);
+   }
++}
++
++// Firefox: right-clicking a post / card (not a link, image or selection) saves
++// that post's permalink when we can find one, otherwise the whole page.
++async function saveContextTarget(info, tab) {
++  let permalink = null;
++
++  if (info.targetElementId !== undefined) {
++    try {
++      let [injected] = await browser.scripting.executeScript({
++        target : { tabId: tab.id, frameIds: [ info.frameId ?? 0 ] },
++        func   : findPermalink,
++        args   : [ info.targetElementId ]
++      });
++
++      permalink = injected?.result ?? null;
++    }
++    catch (err) {
++      log('could not inspect the clicked element', err);
++    }
++  }
++
++  if (permalink && permalink !== tab.url) {
++    await saveObject({ url: permalink }, tab);
++  }
++  else {
++    await savePage(tab);
++  }
++}
++
++// Runs in the page. Walks up from the right-clicked element to the nearest
++// post-like container and returns its permalink.
++function findPermalink(targetElementId) {
++  const el = browser.menus.getTargetElement(targetElementId);
++
++  if (!el || !el.closest) return null;
++
++  const postPattern = /\/status\/\d+|\/watch\?v=|\/shorts\/|\/reels?\/|\/p\/[\w-]+|\/comments\/|\/posts?\//;
++
++  const href = a => (a && /^https?:/.test(a.href)) ? a.href : null;
++
++  // Reddit
++  const redditPost = el.closest('shreddit-post[permalink]');
++
++  if (redditPost) {
++    return new URL(redditPost.getAttribute('permalink'), location.href).href;
++  }
++
++  const link = el.closest('a[href]');
++
++  if (link && postPattern.test(link.href)) return href(link);
++
++  for (let node = el; node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
++    // Stop once we're clearly past a single card (e.g. the whole timeline).
++    if (node.getBoundingClientRect().height > window.innerHeight * 1.5) break;
++
++    if (node.tagName === 'MAIN') break;
++
++    // Social posts link their timestamp to the post (X, Mastodon, Bluesky, Threads…)
++    const timeLink = node.querySelector('a[href] time')?.closest('a');
++
++    if (timeLink) return href(timeLink);
++
++    const postLink = [ ...node.querySelectorAll('a[href]') ].find(a => postPattern.test(a.href));
++
++    if (postLink) return href(postLink);
++  }
++
++  return null;
+ }
+ 
+ function getSaveSelectionRequest() {
+@@ -618,7 +727,9 @@
+     func   : getSaveSelectionRequest
+   });
+ 
+-  let request = injected.result;
++  let request = injected?.result;
++
++  if (!request) return; // Firefox: restricted pages resolve with no result
+ 
+   if (request.error) {
+     console.error('error saving selection', request.error);
+@@ -655,7 +766,7 @@
+     }
+   });
+ 
+-  if (injected.result) return;
++  if (injected?.result) return;
+   
+   await browser.scripting.insertCSS({
+     target: { tabId },

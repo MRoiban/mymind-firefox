@@ -1,0 +1,6 @@
+# Built from mymind's proprietary extension — never commit (see README → Licensing)
+upstream/
+firefox/
+dist/
+
+.DS_Store
